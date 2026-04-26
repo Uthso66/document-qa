@@ -10,6 +10,12 @@ type Message = {
   sources?: string[];
 };
 
+type UploadedDoc = {
+  name: string;
+  chunks: number;
+  id: string;
+};
+
 interface ApiError {
   response?: {
     data?: {
@@ -24,31 +30,86 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const [uploadStatus, setUploadStatus] = useState("");
+  const [uploadedDocs, setUploadedDocs] = useState<UploadedDoc[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const API_BASE = "http://localhost:8000";
 
-  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isAsking]);
 
+  // Load existing documents on mount
+  useEffect(() => {
+    const loadDocs = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/documents`);
+        const docs = res.data.documents.map(
+          (doc: { doc_id: string; source: string; chunks: number }) => ({
+            id: doc.doc_id,
+            name: doc.source,
+            chunks: doc.chunks,
+          }),
+        );
+        setUploadedDocs(docs);
+      } catch {
+        console.error("Failed to load existing documents");
+      }
+    };
+    loadDocs();
+  }, []);
+
   const onDrop = async (acceptedFiles: File[]) => {
-    const file = acceptedFiles[0];
-    if (!file) return;
+    if (acceptedFiles.length === 0) return;
 
     setIsUploading(true);
-    setUploadStatus(`Uploading ${file.name}...`);
+    setUploadStatus(`Uploading ${acceptedFiles.length} file(s)...`);
 
-    const formData = new FormData();
-    formData.append("file", file);
+    let successCount = 0;
+    let failCount = 0;
+    const newDocs: UploadedDoc[] = [];
 
+    for (const file of acceptedFiles) {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      try {
+        const res = await axios.post(`${API_BASE}/upload`, formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        successCount++;
+        const chunkMatch = res.data.message.match(/(\d+) chunks/);
+        const chunks = chunkMatch ? parseInt(chunkMatch[1]) : 0;
+        newDocs.push({
+          name: file.name,
+          chunks: chunks,
+          id: res.data.doc_id,
+        });
+      } catch (err: unknown) {
+        failCount++;
+        console.error(`Failed to upload ${file.name}:`, err);
+      }
+    }
+
+    setUploadedDocs((prev) => [...prev, ...newDocs]);
+    setUploadStatus(
+      `✅ ${successCount} uploaded${failCount > 0 ? `, ${failCount} failed` : ""}`,
+    );
+    setTimeout(() => setUploadStatus(""), 3000);
+    setIsUploading(false);
+  };
+
+  const handleClearAll = async () => {
+    if (!confirm("This will delete ALL uploaded documents. Continue?")) return;
+
+    setIsClearing(true);
     try {
-      const res = await axios.post(`${API_BASE}/upload`, formData, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      setUploadStatus(`✅ ${res.data.message}`);
+      await axios.delete(`${API_BASE}/clear`);
+      setUploadedDocs([]);
+      setMessages([]);
+      setUploadStatus("🗑️ All documents cleared.");
       setTimeout(() => setUploadStatus(""), 3000);
     } catch (err: unknown) {
       const error = err as ApiError;
@@ -56,14 +117,30 @@ export default function Home() {
         `❌ Error: ${error.response?.data?.detail || error.message}`,
       );
     } finally {
-      setIsUploading(false);
+      setIsClearing(false);
+    }
+  };
+
+  const handleDeleteDoc = async (docId: string, docName: string) => {
+    if (!confirm(`Delete "${docName}"?`)) return;
+
+    try {
+      await axios.delete(`${API_BASE}/documents/${docId}`);
+      setUploadedDocs((prev) => prev.filter((doc) => doc.id !== docId));
+      setUploadStatus(`🗑️ Deleted ${docName}`);
+      setTimeout(() => setUploadStatus(""), 3000);
+    } catch (err: unknown) {
+      const error = err as ApiError;
+      setUploadStatus(
+        `❌ Error: ${error.response?.data?.detail || error.message}`,
+      );
     }
   };
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { "application/pdf": [".pdf"] },
-    multiple: false,
+    multiple: true,
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -79,6 +156,7 @@ export default function Home() {
       const res = await axios.post(`${API_BASE}/ask`, {
         question: input,
         top_k: 3,
+        doc_ids: uploadedDocs.map((doc) => doc.id),
       });
 
       const assistantMessage: Message = {
@@ -105,7 +183,7 @@ export default function Home() {
     <main className="min-h-screen bg-gray-950 text-gray-100">
       <div className="max-w-4xl mx-auto p-6">
         {/* Header */}
-        <h1 className="text-3xl font-bold mb-6 text-white">📄 Document Q&A</h1>
+        <h1 className="text-3xl font-bold mb-6 text-white">📚 Document Q&A</h1>
 
         {/* Upload area */}
         <div
@@ -121,7 +199,7 @@ export default function Home() {
             <p className="text-yellow-400 animate-pulse">⏳ Uploading...</p>
           ) : (
             <p className="text-gray-400">
-              📎 Drag & drop a PDF here, or click to select
+              📎 Drag & drop one or more PDFs here, or click to select
             </p>
           )}
         </div>
@@ -132,12 +210,49 @@ export default function Home() {
           </div>
         )}
 
+        {/* Document list */}
+        {uploadedDocs.length > 0 && (
+          <div className="mb-4 p-3 rounded-lg bg-gray-800 border border-gray-700">
+            <div className="flex justify-between items-center mb-2">
+              <h3 className="font-semibold text-sm text-gray-300">
+                📄 Uploaded Documents ({uploadedDocs.length}):
+              </h3>
+              <button
+                onClick={handleClearAll}
+                disabled={isClearing}
+                className="text-xs text-red-400 hover:text-red-300 transition disabled:text-gray-600"
+              >
+                {isClearing ? "Clearing..." : "🗑️ Clear All"}
+              </button>
+            </div>
+            <ul className="text-sm text-gray-400 space-y-1">
+              {uploadedDocs.map((doc) => (
+                <li key={doc.id} className="flex justify-between items-center">
+                  <span className="truncate mr-2">{doc.name}</span>
+                  <div className="flex items-center gap-3 shrink-0">
+                    <span className="text-xs text-gray-500">
+                      {doc.chunks} chunks
+                    </span>
+                    <button
+                      onClick={() => handleDeleteDoc(doc.id, doc.name)}
+                      className="text-xs text-red-500 hover:text-red-400 transition"
+                      title={`Delete ${doc.name}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* Chat area */}
         <div className="border border-gray-700 rounded-xl h-125 overflow-y-auto p-4 mb-4 bg-gray-900">
           {messages.length === 0 && (
             <div className="flex items-center justify-center h-full">
               <p className="text-gray-500 text-center text-lg">
-                Upload a PDF, then ask questions about its content.
+                Upload PDFs, then ask questions about their content.
               </p>
             </div>
           )}
@@ -199,13 +314,13 @@ export default function Home() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask a question about your document..."
+            placeholder="Ask a question about your documents..."
             className="flex-1 bg-gray-800 border border-gray-600 text-gray-100 placeholder-gray-500 px-4 py-3 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
             disabled={isAsking}
           />
           <button
             type="submit"
-            disabled={isAsking}
+            disabled={isAsking || uploadedDocs.length === 0}
             className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-xl font-medium transition disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed"
           >
             Send
